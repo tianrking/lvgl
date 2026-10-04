@@ -1,4 +1,4 @@
-name: LVGL Bidi original Linux validation
+name: LVGL Bidi Linux candidate validation
 
 'on':
   push:
@@ -7,12 +7,20 @@ name: LVGL Bidi original Linux validation
 permissions:
   contents: read
 
+env:
+  SOURCE_SHA: 2ad3cca3e615e19177e10b907e39d886749beea5
+  BASE_SHA: 389dbdeefbda0bec18285e16e886bc897bd78a9c
+
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: lvgl-bidi-helper-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  original-native:
+  focused-green:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -24,20 +32,23 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: '3.12'
-      - name: Record and verify original source
+      - name: Record and verify exact formal source
         run: |
           mkdir -p evidence
-          git diff --exit-code 1ff7c7d07ac44412a3c6e7434aeda939241d47e8 -- . ':(exclude).github/workflows/**'
-          test "$(git hash-object src/misc/lv_bidi.c)" = "$(git rev-parse 389dbdeefbda0bec18285e16e886bc897bd78a9c:src/misc/lv_bidi.c)"
-          test "$(git hash-object tests/src/test_cases/test_bidi.c)" = "$(git rev-parse 1ff7c7d07ac44412a3c6e7434aeda939241d47e8:tests/src/test_cases/test_bidi.c)"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git diff --name-only "$BASE_SHA" > evidence/changed-files.txt
+          printf '%s
+' src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/expected-files.txt
+          diff -u evidence/expected-files.txt evidence/changed-files.txt
           git rev-parse HEAD > evidence/source-head.txt
           git show -s --format=fuller > evidence/commit-identity.txt
-          git diff 389dbdeefbda0bec18285e16e886bc897bd78a9c -- src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/test-only.patch
+          git diff 389dbdeefbda0bec18285e16e886bc897bd78a9c -- src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/candidate.patch
           sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-before.sha256
       - name: Install official prerequisites
         run: |
@@ -58,9 +69,11 @@ jobs:
           cmake --build build-native --target test_bidi test_text_ap test_txt --parallel 2 2>&1 | tee evidence/build.log
           cp build-native/CMakeCache.txt build-native/compile_commands.json build-native/lv_conf_expanded.h evidence/
           sha256sum build-native/lv_conf_expanded.h > evidence/config.sha256
+          echo 'c1c9c9a84e738434132ce4dadd758683daaf07ee0c42e3c1412688b0dd22717b  build-native/lv_conf_expanded.h' | sha256sum -c -
+          echo '54d7d4068d280c4fdfaa15cc98299463f3dcd31b24037feedaaca7a062cdbd0a  evidence/compiler.txt' | sha256sum -c -
           sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-after-build.sha256
           diff -u evidence/source-before.sha256 evidence/source-after-build.sha256
-      - name: Run original three targets and retain actual exit code
+      - name: Run fixed three targets and retain actual exit code
         run: |
           set +e
           ctest --test-dir build-native -j1 --timeout 300 -R '^(test_bidi|test_text_ap|test_txt)$' --verbose --output-on-failure --output-junit "$PWD/evidence/ctest.xml" 2>&1 | tee evidence/ctest.log
@@ -74,16 +87,17 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: original-native-evidence
+          name: focused-green-evidence
           path: evidence/
           retention-days: 30
 
-  official-formatter:
+  quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ env.SOURCE_SHA }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -101,9 +115,146 @@ jobs:
           python scripts/code-format.py > evidence/format.log
           git diff --binary > evidence/format.patch
           git diff --stat
+          git diff --exit-code
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Install official policy-check dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cppcheck doxygen
+          python -m pip install kconfiglib pyyaml fonttools brotli
+      - name: Run upstream static and contribution checks
+        run: |
+          python scripts/static_checks/check_headers.py public-api
+          python scripts/static_checks/check_headers.py private-api
+          python scripts/static_checks/check_headers.py include-paths
+          python scripts/static_checks/check_headers.py allowed-list-audit
+          python scripts/static_checks/check_headers.py no-direct-public-include
+          python scripts/static_checks/check_lv_types.py
+          python scripts/static_checks/check_defconfigs.py
+          python scripts/static_checks/check_labeler.py globs
+          python scripts/static_checks/check_comments.py src/core
+          python scripts/static_checks/check_file_template.py
+          python scripts/static_checks/check_arg_checks.py
+          python scripts/commit_msg_check.py --self-test
+          python scripts/commit_msg_check.py --base "$BASE_SHA"
+          python scripts/check_cppcheck.py --self-test
+          python scripts/check_cppcheck.py --diff "$BASE_SHA...$SOURCE_SHA"
+          if grep -qP '^ +' Kconfig; then exit 1; fi
+          python scripts/kconfig_verify.py Kconfig
+          (cd scripts && python font_license_verify.py --no-strict)
+          git diff --check "$BASE_SHA"
+          git rev-parse HEAD > evidence/source-head.txt
+          git show -s --format=fuller > evidence/commit-identity.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
-          name: original-format-evidence
+          name: quality-evidence
+          path: evidence/
+          retention-days: 30
+
+
+  native-matrix:
+    needs: [focused-green, quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [64, 32]
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      PYTHONUTF8: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Record exact source and toolchain
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git rev-parse HEAD > evidence/source-head.txt
+          git diff "$BASE_SHA" -- src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/candidate.patch
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-before.sha256
+          gcc --version > evidence/compiler.txt
+          cmake --version >> evidence/compiler.txt
+          find tests/configs -name '*.defconfig' -print0 | sort -z | xargs -0 sha256sum > evidence/config-fragments.sha256
+      - name: Install and verify official prerequisites
+        run: |
+          scripts/install-prerequisites.sh 2>&1 | tee evidence/prerequisites.log
+          scripts/install_pngquant.sh 2>&1 | tee evidence/pngquant.log
+          scripts/run_tests.sh --skip-tests 2>&1 | tee evidence/prerequisites-check.log
+      - name: Set official sanitizer environment
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Select 32-bit build when requested
+        if: matrix.arch == 32
+        run: echo 'NON_AMD64_BUILD=1' >> "$GITHUB_ENV"
+      - name: Run complete official executable matrix and coverage
+        run: |
+          python tests/main.py --report --update-image test --auto-clean --keep-report 2>&1 | tee evidence/full-native.log
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-after.sha256
+          diff -u evidence/source-before.sha256 evidence/source-after.sha256
+          python scripts/check_gcov_coverage.py --commit="$BASE_SHA...$SOURCE_SHA" --fail-under=50 --min-lines=5 --report evidence/coverage.json 2>&1 | tee evidence/coverage.log
+          git status --porcelain -- tests/ref_imgs* > evidence/reference-image-status.txt
+          if grep -q '^??' evidence/reference-image-status.txt; then
+            echo 'New reference images were generated; full validation is not clean'
+            exit 1
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: full-native-${{ matrix.arch }}-evidence
+          path: evidence/
+          retention-days: 30
+
+  build-matrix:
+    needs: [focused-green, quality]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        option: [OPTIONS_MINIMAL, OPTIONS_NO_CHECKS, OPTIONS_LINUX_SW, OPTIONS_LINUX_OPENGLES, OPTIONS_NUTTX]
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      PYTHONUTF8: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Record exact source
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git rev-parse HEAD > evidence/source-head.txt
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-before.sha256
+      - name: Install and verify official prerequisites
+        run: |
+          scripts/install-prerequisites.sh 2>&1 | tee evidence/prerequisites.log
+          scripts/run_tests.sh --skip-tests 2>&1 | tee evidence/prerequisites-check.log
+      - name: Build official configuration
+        run: |
+          python tests/main.py --build-options '${{ matrix.option }}' build --auto-clean 2>&1 | tee evidence/build-only.log
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-after.sha256
+          diff -u evidence/source-before.sha256 evidence/source-after.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: build-${{ matrix.option }}-evidence
           path: evidence/
           retention-days: 30
