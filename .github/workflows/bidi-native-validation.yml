@@ -43,8 +43,7 @@ jobs:
           mkdir -p evidence
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           git diff --name-only "$BASE_SHA" > evidence/changed-files.txt
-          printf '%s
-' src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/expected-files.txt
+          printf '%s\n' src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/expected-files.txt
           diff -u evidence/expected-files.txt evidence/changed-files.txt
           git rev-parse HEAD > evidence/source-head.txt
           git show -s --format=fuller > evidence/commit-identity.txt
