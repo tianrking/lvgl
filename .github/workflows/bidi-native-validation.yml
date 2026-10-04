@@ -1,0 +1,109 @@
+name: LVGL Bidi original Linux validation
+
+'on':
+  push:
+    branches: [codex/bidi-arabic-indic-native-checks]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lvgl-bidi-helper-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  original-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: gcc
+      CXX: g++
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      CTEST_PARALLEL_LEVEL: 1
+      PYTHONUTF8: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - name: Record and verify original source
+        run: |
+          mkdir -p evidence
+          git diff --exit-code 1ff7c7d07ac44412a3c6e7434aeda939241d47e8 -- . ':(exclude).github/workflows/**'
+          test "$(git hash-object src/misc/lv_bidi.c)" = "$(git rev-parse 389dbdeefbda0bec18285e16e886bc897bd78a9c:src/misc/lv_bidi.c)"
+          test "$(git hash-object tests/src/test_cases/test_bidi.c)" = "$(git rev-parse 1ff7c7d07ac44412a3c6e7434aeda939241d47e8:tests/src/test_cases/test_bidi.c)"
+          git rev-parse HEAD > evidence/source-head.txt
+          git show -s --format=fuller > evidence/commit-identity.txt
+          git diff 389dbdeefbda0bec18285e16e886bc897bd78a9c -- src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/test-only.patch
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-before.sha256
+      - name: Install official prerequisites
+        run: |
+          scripts/install-prerequisites.sh 2>&1 | tee evidence/prerequisites.log
+          scripts/run_tests.sh --skip-tests 2>&1 | tee evidence/prerequisites-check.log
+      - name: Apply upstream sanitizer environment setting
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure official DEFHEAP recipe and build three targets
+        run: |
+          gcc --version > evidence/compiler.txt
+          g++ --version >> evidence/compiler.txt
+          cmake --version >> evidence/compiler.txt
+          ruby --version >> evidence/compiler.txt
+          python tests/gen_gltf_assets.py
+          fragments=$(PYTHONPATH=tests python -c 'import main; print(";".join(main.get_defconfig_paths("OPTIONS_TEST_DEFHEAP")))')
+          printf '%s\n' "$fragments" > evidence/config-fragments.txt
+          cmake -S . -B build-native -GNinja -DCMAKE_BUILD_TYPE=Debug -DLV_BUILD_TESTS=ON -DLVGL_TEST_ENABLE=ON "-DLV_BUILD_DEFCONFIG_PATH=$fragments" 2>&1 | tee evidence/configure.log
+          cmake --build build-native --target test_bidi test_text_ap test_txt --parallel 2 2>&1 | tee evidence/build.log
+          cp build-native/CMakeCache.txt build-native/compile_commands.json build-native/lv_conf_expanded.h evidence/
+          sha256sum build-native/lv_conf_expanded.h > evidence/config.sha256
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-after-build.sha256
+          diff -u evidence/source-before.sha256 evidence/source-after-build.sha256
+      - name: Run original three targets and retain actual exit code
+        run: |
+          set +e
+          ctest --test-dir build-native -j1 --timeout 300 -R '^(test_bidi|test_text_ap|test_txt)$' --verbose --output-on-failure --output-junit "$PWD/evidence/ctest.xml" 2>&1 | tee evidence/ctest.log
+          result=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$result" > evidence/ctest.exit
+          cp build-native/Testing/Temporary/LastTest.log evidence/
+          sha256sum src/misc/lv_bidi.c tests/src/test_cases/test_bidi.c > evidence/source-after-test.sha256
+          diff -u evidence/source-before.sha256 evidence/source-after-test.sha256
+          exit "$result"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: original-native-evidence
+          path: evidence/
+          retention-days: 30
+
+  official-formatter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: lvgl/astyle
+          ref: a598de18ecc52a82c27b6fdc53072dd021629a98
+          path: .astyle-tool
+          persist-credentials: false
+      - name: Build official AStyle and export formatting changes
+        run: |
+          mkdir -p evidence
+          make -C .astyle-tool/build/gcc -j2
+          sudo make -C .astyle-tool/build/gcc install
+          astyle --version | tee evidence/astyle-version.txt
+          python scripts/code-format.py > evidence/format.log
+          git diff --binary > evidence/format.patch
+          git diff --stat
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: original-format-evidence
+          path: evidence/
+          retention-days: 30
